@@ -260,6 +260,12 @@ def build_home_tab(state: AppState, navigate: Callable[[str], None],
     reply_copy.setObjectName("soft")
     reply_copy.setToolTip("Copy this reply to the clipboard")
 
+    stop_speech_btn = QtWidgets.QPushButton("⏹ Stop voice")
+    stop_speech_btn.setObjectName("soft")
+    stop_speech_btn.setToolTip("Stop Habi from reading aloud")
+    stop_speech_btn.setVisible(False)
+    stop_speech_btn.clicked.connect(lambda: (state.stop_speaking(), stop_speech_btn.setVisible(False)))
+
     def on_copy_reply() -> None:
         if reply.text():
             QtWidgets.QApplication.clipboard().setText(reply.text())
@@ -268,6 +274,7 @@ def build_home_tab(state: AppState, navigate: Callable[[str], None],
     reply_copy.clicked.connect(on_copy_reply)
     rl.addWidget(reply_icon)
     rl.addWidget(reply, 1)
+    rl.addWidget(stop_speech_btn)
     rl.addWidget(reply_copy)
     layout.addWidget(reply_box)
 
@@ -467,24 +474,34 @@ def build_home_tab(state: AppState, navigate: Callable[[str], None],
 
     def _speak_answer(answer: str) -> None:
         """Speak a companion reply aloud without blocking the UI."""
+        state.stop_speaking()
+        spoken = answer.split("[Extended Technical Breakdown]")[0].strip()
+        spoken = spoken.replace("•", "").replace("✦", "").strip()
+        if not spoken:
+            return
         try:
             from ..voice_worker import create_speak_worker
         except ImportError:
             return
         try:
-            worker = create_speak_worker(state.voice_coordinator(), answer,
+            worker = create_speak_worker(state.voice_coordinator(), spoken,
                                          parent=root)
         except (ValueError, Exception):
             return
         _workers.append(worker)
+        state._active_speak_worker = worker
+
+        stop_speech_btn.setVisible(True)
 
         def _started() -> None:
             try:
                 visor_face.set_state("listening")
             except Exception:
                 pass
+            stop_speech_btn.setVisible(True)
 
         def _over() -> None:
+            stop_speech_btn.setVisible(False)
             try:
                 _workers.remove(worker)
             except ValueError:
@@ -496,15 +513,42 @@ def build_home_tab(state: AppState, navigate: Callable[[str], None],
             refresh_content()
 
         def _failed(message: str) -> None:
+            stop_speech_btn.setVisible(False)
             status.showMessage(f"Speech unavailable: {message}", 6000)
             _over()
 
         worker.speak_started.connect(_started)
         worker.speak_finished.connect(_over)
         worker.speak_error.connect(_failed)
+        worker.speak_cancelled.connect(_over)
         worker.start()
 
+    def _render_answer(answer: str) -> None:
+        state.stop_speaking()
+        reply.setText(f"{state.prefs.assistant_name}:\n{answer}")
+        reply_box.setVisible(True)
+        status.showMessage("Habi answered.", 4000)
+        _speak_answer(answer)
+
+    def _memory_fallback(text: str) -> str:
+        hits = state.search(text, top_k=2, min_confidence=0.0)
+        if hits:
+            habits_desc = "; ".join(h.name for h in hits)
+            return f"Relevant habits in your memory: {habits_desc}. Head to the Replicate tab to apply them to this task."
+        return f"Habi is active and learning from your workspace. Ask me to explain code, plan a feature, or run Replicate to draft solutions."
+
+    def _answer(intent: str, text: str, llama_reply: Any = None) -> None:
+        # respond() always runs: it owns the stop E-stop latch and the
+        # approval binding. Llama's phrasing only rewords the terse
+        # control replies (stop/sleep); knowledge and approval answers
+        # keep the companion wording with their live outcomes.
+        answer = state.respond(intent, text)
+        if llama_reply and intent in ("stop", "sleep"):
+            answer = str(llama_reply)
+        _render_answer(answer)
+
     def on_ask() -> None:
+        state.stop_speaking()
         text = explore.text().strip()
         if not text:
             status.showMessage("Type something to explore first.", 4000)
@@ -512,53 +556,119 @@ def build_home_tab(state: AppState, navigate: Callable[[str], None],
             return
         parsed = state.parse_utterance(text)
         if parsed.get("intent") and parsed["intent"] not in ("unknown", None):
-            answer = state.respond(parsed["intent"], parsed["text"])
-        else:
-            hits = state.search(text, top_k=2, min_confidence=0.0)
-            if hits:
-                habits_desc = "; ".join(h.name for h in hits)
-                answer = f"Relevant habits in your memory: {habits_desc}. Head to the Replicate tab to apply them to this task."
+            _answer(parsed["intent"], parsed["text"])
+            return
+        # Unknown to the keyword parser: consult the local Llama
+        # intent parser off the UI thread, then answer or fall back
+        # to the memory search.
+        provider = (getattr(state.prefs, "model_provider", "") or "").strip().lower()
+        if provider in ("offline", "", "none"):
+            _render_answer(_memory_fallback(text))
+            return
+        try:
+            from ..observe_worker import create_callable_worker
+        except ImportError:
+            _render_answer(_memory_fallback(text))
+            return
+        ask_btn.setEnabled(False)
+        try:
+            visor_face.set_state("thinking")
+        except Exception:
+            pass
+        status.showMessage("Habi is thinking…", 4000)
+        worker = create_callable_worker(
+            state.parse_utterance_smart, (text,), {"timeout_s": 4.0},
+            parent=root)
+        _workers.append(worker)
+
+        def _release_ask_worker() -> None:
+            ask_btn.setEnabled(True)
+            try:
+                _workers.remove(worker)
+            except ValueError:
+                pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+            refresh_content()
+
+        def _smart_done(smart: object) -> None:
+            _release_ask_worker()
+            data = smart if isinstance(smart, dict) else {}
+            intent = data.get("intent") or "unknown"
+            if intent not in ("unknown", None, ""):
+                _answer(str(intent), str(data.get("text", text)),
+                        data.get("reply"))
             else:
-                answer = f"Habi is active and learning from your workspace. Ask me to explain code, plan a feature, or run Replicate to draft solutions."
-        reply.setText(f"{state.prefs.assistant_name}: {answer}")
-        reply_box.setVisible(True)
-        status.showMessage("Habi answered.", 4000)
-        _speak_answer(answer)
+                _render_answer(_memory_fallback(text))
+
+        def _smart_failed(message: str) -> None:
+            _release_ask_worker()
+            _render_answer(_memory_fallback(text))
+
+        def _smart_cancelled() -> None:
+            _release_ask_worker()
+            status.showMessage("Question cancelled.", 4000)
+
+        worker.callable_finished.connect(_smart_done)
+        worker.callable_error.connect(_smart_failed)
+        worker.callable_cancelled.connect(_smart_cancelled)
+        worker.start()
 
     def on_mic() -> None:
-        try:
-            from ..voice_worker import create_listen_worker
-        except ImportError:
-            status.showMessage("Listening… speak now.", 4000)
-            prev = explore.placeholderText()
-            explore.setPlaceholderText("Listening… speak now.")
-            ok, heard = state.try_listen(timeout_sec=6.0)
-            explore.setPlaceholderText(prev)
-            if ok:
-                explore.setText(heard)
-                explore.setFocus()
-            else:
-                status.showMessage(f"Microphone: {heard}", 8000)
+        state.stop_speaking()
+        if getattr(mic_btn, "_is_listening", False):
+            worker = getattr(mic_btn, "_active_worker", None)
+            if worker is not None:
+                worker.cancel()
+            _reset_mic()
+            status.showMessage("Voice listening cancelled.", 3000)
             return
-        status.showMessage("Listening… speak now.", 6000)
-        mic_btn.setEnabled(False)
+
+        mic_btn._is_listening = True
+        mic_btn.setText("⏹")
+        mic_btn.setStyleSheet("background-color: #EF4444; color: #FFFFFF; border-radius: 16px; font-weight: bold;")
+        mic_btn.setToolTip("Listening... Click to stop")
         prev_placeholder = explore.placeholderText()
-        explore.setPlaceholderText("Listening… speak now.")
+        explore.setPlaceholderText("🎙️ Listening to your voice... Speak now.")
+        status.showMessage("Listening… speak now.", 6000)
         try:
             visor_face.set_state("listening")
         except Exception:
             pass
+
+        def _reset_mic() -> None:
+            mic_btn._is_listening = False
+            mic_btn._active_worker = None
+            mic_btn.setText("🎙")
+            mic_btn.setStyleSheet("")
+            mic_btn.setToolTip("Speak instead of typing (needs a microphone)")
+            explore.setPlaceholderText(prev_placeholder)
+            try:
+                visor_face.set_state("observing")
+            except Exception:
+                pass
+
+        try:
+            from ..voice_worker import create_listen_worker
+        except ImportError:
+            ok, heard = state.try_listen(timeout_sec=6.0)
+            _done(ok, heard)
+            return
+
         worker = create_listen_worker(state.voice_coordinator(),
                                       timeout_sec=6.0, parent=root)
+        mic_btn._active_worker = worker
         _workers.append(worker)
 
         def _done(ok: bool, heard: str) -> None:
-            mic_btn.setEnabled(True)
-            explore.setPlaceholderText(prev_placeholder)
+            _reset_mic()
             if ok:
                 explore.setText(heard)
                 explore.setFocus()
-                status.showMessage("Heard you — press Enter to ask.", 4000)
+                status.showMessage(f"Heard: '{heard}'", 4000)
+                on_ask()
             else:
                 status.showMessage(f"Microphone: {heard}", 8000)
             try:
@@ -572,6 +682,7 @@ def build_home_tab(state: AppState, navigate: Callable[[str], None],
             refresh_content()
 
         worker.listen_finished.connect(_done)
+        worker.listen_cancelled.connect(_reset_mic)
         worker.start()
 
     def on_showcase_log(text: str) -> None:
@@ -612,6 +723,14 @@ def build_home_tab(state: AppState, navigate: Callable[[str], None],
             pass
 
     def on_showcase_done(success: bool) -> None:
+        # Break the thread → runner link deterministically so the
+        # runner's teardown never depends on cyclic-GC timing.
+        _done_thread = _showcase.get("thread")
+        if _done_thread is not None:
+            try:
+                _done_thread._mimir_runner = None
+            except Exception:
+                pass
         showcase_btn.setEnabled(True)
         showcase_btn.setText("▶ Run Live Habi Showcase")
         try:
@@ -663,14 +782,20 @@ def build_home_tab(state: AppState, navigate: Callable[[str], None],
         runner = ShowcaseRunner(state, speak_live=True)
         thread = QtCore.QThread(root)
         thread._mimir_runner = runner  # found by MainWindow.shutdown
-        runner.moveToThread(thread)
+        # The runner deliberately keeps GUI-thread affinity: the scenes
+        # already execute on the worker (via the started lambda below)
+        # and its signals queue to the tab slots from any thread, while
+        # moving it to the worker strands its C++ on a dead thread at
+        # teardown (deleteLater never delivered → use-after-free in an
+        # unrelated test's GC pass). Both deferred deletions below land
+        # on the live GUI thread.
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(runner.deleteLater)
         thread.started.connect(lambda: runner.run_all())
         runner.scene_changed.connect(on_showcase_scene)
         runner.visor_state_requested.connect(on_showcase_visor)
         runner.log_message.connect(on_showcase_log)
         runner.showcase_completed.connect(on_showcase_done)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(runner.deleteLater)
         _showcase["thread"] = thread
         _showcase["runner"] = runner
         thread.start()

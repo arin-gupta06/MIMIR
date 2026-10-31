@@ -21,7 +21,7 @@ from .cadence import CadenceObserver
 from .devstate import DeveloperStateEngine
 from .events import Event, EventBus, EventType, Subscription, get_event_bus
 from .git_observe import GitObserver
-from .watch_fs import FilesystemWatcher
+from .watch_fs import DEFAULT_DEBOUNCE_S, FilesystemWatcher
 
 __all__ = ["SensoryService"]
 
@@ -42,6 +42,7 @@ class SensoryService:
         poll_interval_s: float = 1.0,
         git_poll_interval_s: float = 5.0,
         enable_cadence: bool = False,
+        debounce_s: float = DEFAULT_DEBOUNCE_S,
     ) -> None:
         self.bus = bus if bus is not None else get_event_bus()
         self.session_id = session_id
@@ -51,6 +52,7 @@ class SensoryService:
             session_id=session_id,
             backend=fs_backend,
             poll_interval_s=poll_interval_s,
+            debounce_s=debounce_s,
         )
         self.ast = AstObserver(bus=self.bus, session_id=session_id)
         self.cadence = CadenceObserver(bus=self.bus, session_id=session_id)

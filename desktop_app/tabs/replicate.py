@@ -449,6 +449,7 @@ def build_replicate_tab(state: AppState, status: Any) -> Any:
         from mimir.actuator import DesktopActuator
         from mimir.desktop import TargetSpec
         from ..actuate_worker import (
+            acquire_editor_target,
             create_drive_worker,
             format_countdown,
             list_drive_targets,
@@ -483,7 +484,21 @@ def build_replicate_tab(state: AppState, status: Any) -> Any:
                              None)
         for handle, label in targets:
             target_combo.addItem(f"{label}  [#{handle}]", handle)
-        if foreground is not None:
+        # Bridge 2 pre-flight: prefer a live code editor (VS Code,
+        # Cursor, ...) over the foreground app, so one click drives
+        # into the editor instead of wherever focus happens to be.
+        try:
+            editor = acquire_editor_target(focus=False)
+            editor_handle = editor.handle if editor is not None else None
+        except Exception:
+            editor_handle = None
+        preselected = False
+        if editor_handle is not None:
+            index = target_combo.findData(editor_handle)
+            if index >= 0:
+                target_combo.setCurrentIndex(index)
+                preselected = True
+        if not preselected and foreground is not None:
             index = target_combo.findData(foreground)
             if index >= 0:
                 target_combo.setCurrentIndex(index)
@@ -570,6 +585,15 @@ def build_replicate_tab(state: AppState, status: Any) -> Any:
                 dialog.close()
             except Exception:
                 pass
+            # Restore the companion if the drive minimized it.
+            try:
+                host = root.window()
+                if host is not None and host.isMinimized():
+                    host.showNormal()
+                    host.raise_()
+                    host.activateWindow()
+            except Exception:
+                pass
 
         def _tick(left: int) -> None:
             countdown_label.setText(format_countdown(left))
@@ -582,6 +606,17 @@ def build_replicate_tab(state: AppState, status: Any) -> Any:
                 state.visor.set_state("driving")
             except Exception:
                 pass
+            # Get out of the way: minimize the companion once the
+            # cursor starts moving (the focus guard has already
+            # activated the target). ESC / mouse-nudge failsafe still
+            # stops the drive; the window is restored on settle.
+            if target is not None:
+                try:
+                    host = root.window()
+                    if host is not None:
+                        host.showMinimized()
+                except Exception:
+                    pass
             # The dialog countdown is the explicit GUI confirmation:
             # authorize + mark executing for the audit trail. A denial
             # (latched E-stop) aborts before any input lands — and the

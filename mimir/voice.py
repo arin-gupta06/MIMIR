@@ -1,8 +1,9 @@
 """Voice coordination engine: hands-free MIMIR interaction (Days 8-9).
 
-Speech-to-text (local Whisper) and text-to-speech (Edge-TTS) sit behind
-the backend names ``"whisper_local"`` / ``"edge_tts"``; either backend
-also accepts an injected callable so coordination logic (timeouts,
+Speech-to-text (local Whisper) and text-to-speech (Edge-TTS, with an
+offline ``"sapi"`` fallback on Windows) sit behind the backend names
+``"whisper_local"`` / ``"edge_tts"`` / ``"sapi"``; either backend also
+accepts an injected callable so coordination logic (timeouts,
 ``on_start`` hooks, intent parsing) stays fully testable without a
 microphone or speakers. :meth:`VoiceCoordinator.parse_intent` is pure
 keyword logic mapping utterances to coordination intents.
@@ -151,7 +152,10 @@ STTBackend = Union[str, Callable[[float], Optional[str]]]
 TTSBackend = Union[str, Callable[[str], None]]
 
 _KNOWN_STT = ("whisper_local",)
-_KNOWN_TTS = ("edge_tts",)
+# "sapi" is the offline OS speech fallback (Windows System.Speech, or
+# espeak/spd-say on POSIX). Edge stays the default neural voice; when
+# edge synthesis fails at runtime (offline), speak() falls back to it.
+_KNOWN_TTS = ("edge_tts", "sapi")
 
 
 def _normalize(text: str) -> str:
@@ -259,6 +263,8 @@ class VoiceCoordinator:
                 self.tts_backend(text)
             except Exception as exc:
                 raise VoiceError(f"tts backend failed: {exc}") from exc
+        elif self.tts_backend == "sapi":
+            self._sapi_speak(text)
         else:
             self._edge_speak(text)
 
@@ -370,12 +376,122 @@ class VoiceCoordinator:
         try:
             asyncio.run(synthesize(path))
         except Exception as exc:
+            # Offline at runtime (edge-tts needs network): fall back to
+            # the OS speech synthesizer instead of going silent. A
+            # missing edge-tts install still raises above with its hint.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            try:
+                self._sapi_speak(text)
+                return
+            except VoiceError:
+                pass
             raise VoiceError(f"edge-tts synthesis failed: {exc}") from exc
         # Fire-and-forget playback through headless OS audio subsystem (no media player windows).
         try:
             _play_audio_headless(path)
         except Exception as exc:
             raise VoiceError(f"audio playback failed: {exc}") from exc
+
+    def stop_speaking(self) -> None:
+        """Immediately interrupt and stop any active speech synthesis or audio."""
+        proc = getattr(self, "_active_proc", None)
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.kill()
+            except Exception:
+                pass
+            self._active_proc = None
+        proc2 = getattr(self, "_active_play_proc", None)
+        if proc2 is not None:
+            try:
+                proc2.terminate()
+                proc2.kill()
+            except Exception:
+                pass
+            self._active_play_proc = None
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                winmm = ctypes.windll.winmm
+                winmm.mciSendStringW("stop all", None, 0, None)
+                winmm.mciSendStringW("close all", None, 0, None)
+            except Exception:
+                pass
+
+    def _sapi_speak(self, text: str) -> None:
+        """Speak via the offline OS synthesizer (no network needed).
+
+        Windows uses the built-in System.Speech voice through a hidden
+        PowerShell host; POSIX tries ``espeak`` then ``spd-say``.
+        Raises :class:`VoiceError` when no offline voice is available.
+        """
+        import os
+        import tempfile
+
+        if os.name == "nt":
+            fd, path = tempfile.mkstemp(suffix=".txt",
+                                        prefix="mimir_say_")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                # The text travels via file so no quoting can break the
+                # command line or inject PowerShell.
+                script = (
+                    "Add-Type -AssemblyName System.Speech; "
+                    "$s = New-Object System.Speech.Synthesis."
+                    "SpeechSynthesizer; "
+                    "$s.Speak([System.IO.File]::ReadAllText('"
+                    + path.replace("'", "''") + "'))"
+                )
+                try:
+                    proc = subprocess.run(
+                        ["powershell", "-NoProfile", "-NonInteractive",
+                         "-Command", script],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=90,
+                        creationflags=0x08000000,
+                    )
+                except FileNotFoundError:
+                    raise VoiceError(
+                        "sapi speech unavailable: powershell not found"
+                    ) from None
+                except subprocess.TimeoutExpired:
+                    raise VoiceError("sapi speech timed out") from None
+            finally:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            if proc.returncode != 0:
+                raise VoiceError(
+                    "sapi speech failed "
+                    f"(exit {proc.returncode})"
+                )
+            return
+        for command in (["espeak", text], ["spd-say", text]):
+            try:
+                proc = subprocess.run(
+                    command,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=90,
+                )
+            except FileNotFoundError:
+                continue
+            except subprocess.TimeoutExpired:
+                raise VoiceError("offline speech timed out") from None
+            if proc.returncode == 0:
+                return
+        raise VoiceError(
+            "offline speech unavailable (no sapi/espeak/spd-say)"
+        )
 
 
 def _play_audio_headless(path: str) -> None:

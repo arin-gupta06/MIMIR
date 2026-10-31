@@ -58,10 +58,22 @@ class WatchController:
         self._retired: list[Any] = []
         self._idle = threading.Event()
         self._idle.set()
+        # Bridge 4 live senses: real-time FS watcher + AST deltas +
+        # visor bus binding, alive exactly while watching. Daemon
+        # threads owned by SensoryService; visor tokens unsubscribed
+        # on stop so repeated watch cycles never stack handlers.
+        self._sensory: Any = None
+        self._visor_tokens: list[Any] = []
 
     @property
     def watching(self) -> bool:
         return self._timer.isActive()
+
+    @property
+    def live_senses(self) -> Optional[dict[str, Any]]:
+        """Live-senses snapshot (None when the daemon is off)."""
+        return self.state.live_senses
+
 
     def start(self, repo: str, roots: list[str],
               max_commits: int = 10) -> tuple[bool, str]:
@@ -77,6 +89,7 @@ class WatchController:
         self.last_error = ""
         self.state.set_watching(True)
         self._timer.start()
+        self._start_live_senses()
         self._announce(f"Observing {repo} — {len(fresh)} new episode(s).")
         self._chime()
         return (True, f"Observing — {len(fresh)} new episode(s).")
@@ -162,6 +175,7 @@ class WatchController:
         self._announce(f"Observing {self.repo} — {count} new episode(s).")
         self._chime()
         self._timer.start()
+        self._start_live_senses()
         self._report_fresh(fresh)
         self._finish_start(True, message, on_done)
 
@@ -191,9 +205,29 @@ class WatchController:
                 pass
             self._retire(worker)
         self._idle.set()
+        self._stop_live_senses()
         self.state.set_watching(False)
         self._announce("Observation stopped.")
         self._chime()
+
+    def _start_live_senses(self) -> None:
+        """Start the real-time senses daemon (Bridge 4, idempotent)."""
+        self._stop_live_senses()
+        roots = list(self.roots)
+        if self.repo and self.repo not in roots:
+            roots.append(self.repo)
+        try:
+            self.state.start_senses(roots=roots, repo=self.repo)
+        except Exception:
+            pass
+
+    def _stop_live_senses(self) -> None:
+        """Stop the senses daemon and unbind the visor (idempotent)."""
+        try:
+            self.state.stop_senses()
+        except Exception:
+            pass
+
 
     def _retire(self, worker: Any) -> None:
         """Hold a cancelled worker until its thread finishes."""

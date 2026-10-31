@@ -953,7 +953,7 @@ _VISOR_BY_EVENT: dict[EventType, str] = {
     EventType.FILE_CREATED: "observing",
     EventType.FILE_MODIFIED: "observing",
     EventType.FILE_DELETED: "observing",
-    EventType.AST_DELTA: "observing",
+    EventType.AST_DELTA: "thinking",
     EventType.GIT_CHANGED: "observing",
     EventType.CADENCE_UPDATED: "observing",
     EventType.DEVELOPER_STATE_UPDATED: "observing",
@@ -977,24 +977,53 @@ _VISOR_BY_EVENT: dict[EventType, str] = {
 
 
 def bind_visor_to_bus(
-    controller: Any, bus: Optional[EventBus] = None
+    controller: Any,
+    bus: Optional[EventBus] = None,
+    pulse_revert_s: float = 1.5,
 ) -> list[Subscription]:
     """Mirror runtime events onto a visor state machine (opt-in wiring).
 
     ``controller`` is duck-typed (only ``set_state`` is used) so the
     binding stays Qt-free and headless-testable.
+
+    Bridge 4 / Phase 4.3 micro-animation: on AST_DELTA, the visor shifts to
+    THINKING (purple) for 1.5s then returns to the base state.
     """
     target = bus if bus is not None else get_event_bus()
     tokens: list[Subscription] = []
+    revert_timer: list[Any] = [None]
+
+    def _cancel_revert() -> None:
+        if revert_timer[0] is not None:
+            try:
+                revert_timer[0].cancel()
+            except Exception:
+                pass
+            revert_timer[0] = None
+
     for event_type, state in _VISOR_BY_EVENT.items():
         def _follow(
-            _event: Event, _state: str = state,
+            _event: Event,
+            _state: str = state,
             _controller: Any = controller,
+            _etype: EventType = event_type,
         ) -> None:
+            _cancel_revert()
             try:
                 _controller.set_state(_state)
             except Exception:
                 pass
+            if _etype == EventType.AST_DELTA and pulse_revert_s > 0:
+                base = getattr(_controller, "_base_state", "resting")
+                def _do_revert() -> None:
+                    try:
+                        _controller.set_state(base)
+                    except Exception:
+                        pass
+                t = threading.Timer(pulse_revert_s, _do_revert)
+                t.daemon = True
+                revert_timer[0] = t
+                t.start()
 
         tokens.append(
             target.subscribe(event_type, _follow,

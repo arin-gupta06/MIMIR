@@ -126,7 +126,8 @@ class LlmClientTest(unittest.TestCase):
 
     def test_ollama_parses_generate_response(self):
         payload = {"response": "hi there"}
-        with mock.patch("desktop_app.llm.urllib.request.urlopen",
+        # The self-hosted path bypasses proxies via the module opener.
+        with mock.patch("desktop_app.llm._NO_PROXY_OPENER.open",
                         return_value=FakeResponse(payload)):
             self.assertEqual(build_ollama_client()("hi"), "hi there")
 
@@ -863,7 +864,20 @@ class UiWiringRegressionTest(unittest.TestCase):
             main.shutdown()
             self.assertTrue(main._closing)
         finally:
+            main.close()
             main.state.close()
+            try:
+                from desktop_app.tabs._qt import load_qt
+                _, QtCore, _, QtWidgets = load_qt()
+                app = QtWidgets.QApplication.instance()
+                if app is not None:
+                    app.processEvents()
+                    QtCore.QCoreApplication.sendPostedEvents(
+                        None, QtCore.QEvent.Type.DeferredDelete)
+                    app.processEvents()
+            except Exception:
+                pass
+
 
     def test_showcase_cancel_stops_at_boundary(self):
         _needs_qt(self)

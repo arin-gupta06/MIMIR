@@ -33,6 +33,9 @@ EXTRAS = (
     ("openai-whisper", ("whisper",), "On-device speech-to-text engine"),
     ("edge-tts", ("edge_tts",), "Neural voice speech synthesis"),
     ("SpeechRecognition", ("speech_recognition",), "Audio microphone capture"),
+    ("pywin32", ("win32gui",), "Native window focus & enumeration"),
+    ("watchdog", ("watchdog",), "Real-time filesystem senses"),
+    ("qasync", ("qasync",), "Qt/asyncio event-loop bridge"),
 )
 
 
@@ -504,7 +507,7 @@ def build_settings_tab(state: AppState, status: Any) -> Any:
     model_name_input.setPlaceholderText("e.g. gpt-4o-mini (blank = default)")
     model_name_input.setMaximumWidth(360)
     model_endpoint_input = QtWidgets.QLineEdit(state.prefs.model_endpoint or "")
-    model_endpoint_input.setPlaceholderText("http://localhost:11434")
+    model_endpoint_input.setPlaceholderText("http://127.0.0.1:11434")
     model_endpoint_input.setMaximumWidth(360)
 
     from ..llm import normalize_provider as _normalize_provider
@@ -536,10 +539,33 @@ def build_settings_tab(state: AppState, status: Any) -> Any:
     ))
     prov_box.addWidget(setting_row(
         "Local endpoint (Ollama)",
-        "Base URL of the self-hosted Ollama server. Defaults to http://localhost:11434.",
+        "Base URL of the self-hosted Ollama server. Defaults to http://127.0.0.1:11434.",
         model_endpoint_input,
     ))
     model_lay.addWidget(prov_card)
+
+    # Card 1b: Local Ollama daemon health (Bridge 1 diagnostics).
+    oll_card, oll_box = settings_group_card(
+        "Local Ollama Daemon",
+        "Live health-check of the self-hosted Ollama server "
+        "(loopback only — no cloud traffic).",
+    )
+    oll_status = QtWidgets.QLabel("Not checked yet — press Refresh.")
+    oll_status.setObjectName("muted")
+    oll_status.setWordWrap(True)
+    oll_btn_row = QtWidgets.QHBoxLayout()
+    oll_refresh_btn = QtWidgets.QPushButton("Refresh status")
+    oll_refresh_btn.setObjectName("soft")
+    oll_start_btn = QtWidgets.QPushButton("Start Ollama")
+    oll_start_btn.setObjectName("ink")
+    oll_start_btn.setToolTip(
+        "Launch 'ollama serve' in the background (1-click)")
+    oll_btn_row.addWidget(oll_refresh_btn)
+    oll_btn_row.addWidget(oll_start_btn)
+    oll_btn_row.addStretch(1)
+    oll_box.addWidget(oll_status)
+    oll_box.addLayout(oll_btn_row)
+    model_lay.addWidget(oll_card)
 
     # Card 2: Principles Retrieval
     ret_card, ret_box = settings_group_card(
@@ -600,6 +626,95 @@ def build_settings_tab(state: AppState, status: Any) -> Any:
     model_endpoint_input.editingFinished.connect(
         lambda: (setattr(state.prefs, "model_endpoint",
                          model_endpoint_input.text().strip()), save_prefs()))
+
+    def _ollama_endpoint_now() -> str:
+        return (model_endpoint_input.text().strip()
+                or "http://127.0.0.1:11434")
+
+    def _render_ollama(report: object) -> None:
+        data = report if isinstance(report, dict) else {}
+        if data.get("available"):
+            models = data.get("models") or []
+            selected = data.get("selected") or "llama3.2:1b"
+            oll_status.setText(
+                f"● Live at {data.get('endpoint')}: {selected} "
+                f"({len(models)} model(s) installed).")
+            oll_status.setObjectName("ok")
+            # Fresh installs with a blank model inherit the best
+            # installed local model so Generate goes live at once.
+            if not (state.prefs.model_name or "").strip() and models:
+                state.prefs.model_name = selected
+                model_name_input.setText(selected)
+                save_prefs()
+        else:
+            oll_status.setText(
+                "○ Down at "
+                f"{data.get('endpoint', _ollama_endpoint_now())} — "
+                "press Start Ollama, or install it from ollama.com.")
+            oll_status.setObjectName("err")
+        oll_status.style().unpolish(oll_status)
+        oll_status.style().polish(oll_status)
+
+    def _run_ollama_probe(fn: Any, *args: Any) -> None:
+        try:
+            from ..observe_worker import create_callable_worker
+        except ImportError:
+            try:
+                _render_ollama(fn(*args))
+            except Exception as exc:
+                oll_status.setText(f"Check failed: {exc}")
+            return
+        oll_refresh_btn.setEnabled(False)
+        oll_start_btn.setEnabled(False)
+        oll_status.setText("Checking…")
+        worker = create_callable_worker(fn, args, parent=root)
+        _workers.append(worker)
+
+        def _release() -> None:
+            oll_refresh_btn.setEnabled(True)
+            oll_start_btn.setEnabled(True)
+            try:
+                _workers.remove(worker)
+            except ValueError:
+                pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+        def _done(report: object) -> None:
+            # ensure_ollama_daemon returns (ok, message): re-probe so
+            # the card always renders a full daemon snapshot.
+            _release()
+            if isinstance(report, tuple):
+                on_ollama_refresh()
+                status.showMessage(str(report[1]), 8000)
+            else:
+                _render_ollama(report)
+                status.showMessage("Ollama status refreshed.", 3000)
+
+        def _failed(message: str) -> None:
+            _release()
+            oll_status.setText(f"Check failed: {message}")
+            oll_status.setObjectName("err")
+            oll_status.style().unpolish(oll_status)
+            oll_status.style().polish(oll_status)
+
+        worker.callable_finished.connect(_done)
+        worker.callable_error.connect(_failed)
+        worker.start()
+
+    def on_ollama_refresh() -> None:
+        from ..ollama import probe_ollama
+        _run_ollama_probe(probe_ollama, _ollama_endpoint_now())
+
+    def on_ollama_start() -> None:
+        from ..ollama import ensure_ollama_daemon
+        status.showMessage("Starting Ollama daemon…", 6000)
+        _run_ollama_probe(ensure_ollama_daemon, _ollama_endpoint_now())
+
+    oll_refresh_btn.clicked.connect(on_ollama_refresh)
+    oll_start_btn.clicked.connect(on_ollama_start)
 
     # =========================================================================
     # 4. APPEARANCE SUBPAGE
@@ -735,6 +850,10 @@ def build_settings_tab(state: AppState, status: Any) -> Any:
             for widget in app.topLevelWidgets():
                 if hasattr(widget, "set_follow_mouse"):
                     widget.set_follow_mouse(checked)
+                if hasattr(widget, "visor_pill") and getattr(widget, "visor_pill") is not None:
+                    vp = getattr(widget, "visor_pill")
+                    if hasattr(vp, "set_follow_mouse"):
+                        vp.set_follow_mouse(checked)
 
     def on_roam_changed(checked: bool) -> None:
         state.prefs.auto_roam = checked
@@ -744,6 +863,10 @@ def build_settings_tab(state: AppState, status: Any) -> Any:
             for widget in app.topLevelWidgets():
                 if hasattr(widget, "set_auto_roam"):
                     widget.set_auto_roam(checked)
+                if hasattr(widget, "visor_pill") and getattr(widget, "visor_pill") is not None:
+                    vp = getattr(widget, "visor_pill")
+                    if hasattr(vp, "set_auto_roam"):
+                        vp.set_auto_roam(checked)
 
     floating_toggle.toggled.connect(on_floating_changed)
     follow_toggle.toggled.connect(on_follow_changed)

@@ -32,7 +32,8 @@ __all__ = [
 #: Pluggable LLM completion: prompt string in, solution string out.
 LLMFn = Callable[[str], str]
 
-DEFAULT_OLLAMA_ENDPOINT = "http://localhost:11434"
+#: Loopback-only Ollama endpoint (unified with mimir.llama_intent).
+DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "llama3.2:1b"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -75,15 +76,23 @@ def _non_empty(value: str, *, field: str) -> str:
     return value.strip()
 
 
+#: Self-hosted calls must never leave the machine: the Ollama path
+#: bypasses any configured HTTP(S) proxy (which would otherwise add
+#: seconds of timeouts or leak on-device prompts to a middlebox).
+_NO_PROXY_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}))
+
+
 def _post_json(url: str, payload: dict[str, Any],
                headers: dict[str, str],
-               timeout_sec: float = 60.0) -> dict[str, Any]:
+               timeout_sec: float = 60.0,
+               no_proxy: bool = False) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=body, headers=headers,
                                      method="POST")
+    opener = _NO_PROXY_OPENER.open if no_proxy else urllib.request.urlopen
     try:
-        with urllib.request.urlopen(request,
-                                    timeout=timeout_sec) as response:
+        with opener(request, timeout=timeout_sec) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         try:
@@ -119,7 +128,8 @@ def build_ollama_client(endpoint: str = DEFAULT_OLLAMA_ENDPOINT,
                           {"model": model, "prompt": prompt,
                            "stream": False},
                           {"Content-Type": "application/json"},
-                          timeout_sec=timeout_sec)
+                          timeout_sec=timeout_sec,
+                          no_proxy=True)
         text = (data.get("response") or "").strip()
         if not text:
             raise LLMError(f"ollama returned no response text: {data!r}"[:300])

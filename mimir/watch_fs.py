@@ -71,7 +71,8 @@ DEFAULT_EXCLUDE_DIRS = frozenset({
 #: Basename globs for editor/OS noise normalized away (never emitted).
 _NOISE_BASENAME_GLOBS = ("*.tmp", "*.swp", "*.swo", "*~", "~$*")
 
-DEFAULT_DEBOUNCE_S = 0.5
+#: Maturation window for coalescing editor multi-save bursts (300ms).
+DEFAULT_DEBOUNCE_S = 0.3
 DEFAULT_POLL_INTERVAL_S = 1.0
 
 FsKind = Literal["created", "modified", "deleted"]

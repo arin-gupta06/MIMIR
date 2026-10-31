@@ -39,6 +39,7 @@ __all__ = [
     "ClassInfo",
     "FunctionSig",
     "SourceSummary",
+    "ast_delta_to_episode",
     "diff_summaries",
     "summarize_python_source",
     "summarize_source",
@@ -585,3 +586,111 @@ class AstObserver:
             )
         except Exception:
             return None
+
+
+def ast_delta_to_episode(
+    delta: Any,
+    repo: Optional[str] = None,
+) -> Optional[Any]:
+    """Convert an AST structural delta into a BehavioralEpisode for inductive learning.
+
+    Allows streaming live AST modifications directly to the Detective engine
+    without waiting for git commits (Bridge 4 / Phase 4.2).
+    """
+    import uuid
+    from ._common import utc_now_iso
+    from .episodes import (
+        BehavioralEpisode,
+        EpisodeContext,
+        EpisodeOutcome,
+        FileTransition,
+    )
+
+    if isinstance(delta, dict):
+        path = delta.get("file") or ""
+        lang = delta.get("language") or "python"
+        added_fn = list(delta.get("added_functions") or [])
+        mod_fn = list(delta.get("modified_functions") or [])
+        rem_fn = list(delta.get("removed_functions") or [])
+        added_cls = list(delta.get("added_classes") or [])
+        rem_cls = list(delta.get("removed_classes") or [])
+        syntax_valid = bool(delta.get("syntax_valid", True))
+    else:
+        path = getattr(delta, "path", "")
+        lang = getattr(delta, "language", "python")
+        added_fn = list(getattr(delta, "added_functions", ()))
+        mod_fn = list(getattr(delta, "modified_functions", ()))
+        rem_fn = list(getattr(delta, "removed_functions", ()))
+        added_cls = list(getattr(delta, "added_classes", ()))
+        rem_cls = list(getattr(delta, "removed_classes", ()))
+        syntax_valid = bool(getattr(delta, "syntax_valid", True))
+
+    if not path:
+        return None
+    if not (added_fn or mod_fn or rem_fn or added_cls or rem_cls):
+        return None
+
+    diff_lines = []
+    additions = 0
+    deletions = 0
+    for fn in added_fn:
+        name = getattr(fn, "name", str(fn))
+        diff_lines.append(f"+ def {name}(): ...")
+        additions += 1
+    for fn in mod_fn:
+        name = getattr(fn, "name", str(fn))
+        diff_lines.append(f"~ def {name}(): [modified]")
+        additions += 1
+        deletions += 1
+    for fn in rem_fn:
+        name = getattr(fn, "name", str(fn))
+        diff_lines.append(f"- def {name}(): ...")
+        deletions += 1
+    for cls_name in added_cls:
+        diff_lines.append(f"+ class {cls_name}: ...")
+        additions += 1
+    for cls_name in rem_cls:
+        diff_lines.append(f"- class {cls_name}: ...")
+        deletions += 1
+
+    diff_text = "\n".join(diff_lines)
+    trans = FileTransition(
+        path=path,
+        status="modified",
+        diff=diff_text,
+        additions=additions,
+        deletions=deletions,
+    )
+    ep_id = f"ep_ast_{uuid.uuid4().hex[:8]}"
+    summary_parts = []
+    if added_fn:
+        summary_parts.append(f"added {len(added_fn)} fn(s)")
+    if mod_fn:
+        summary_parts.append(f"modified {len(mod_fn)} fn(s)")
+    if rem_fn:
+        summary_parts.append(f"removed {len(rem_fn)} fn(s)")
+    if added_cls:
+        summary_parts.append(f"added {len(added_cls)} class(es)")
+    summary = f"AST edit on {os.path.basename(path)}: {', '.join(summary_parts)}"
+    return BehavioralEpisode(
+        id=ep_id,
+        source="live_ast",
+        repo=repo or "local",
+        source_ref="ast_delta",
+        observed_at=utc_now_iso(),
+        actor="developer",
+        summary=summary,
+        context=EpisodeContext(
+            scope=os.path.basename(path),
+            language=lang,
+        ),
+        transitions=(trans,),
+        outcome=EpisodeOutcome(
+            build="unknown",
+            tests="unknown",
+            note="syntax valid" if syntax_valid else "syntax invalid",
+        ),
+        redactions_applied=0,
+        redaction_kinds=(),
+    )
+

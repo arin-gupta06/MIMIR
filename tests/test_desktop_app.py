@@ -543,10 +543,13 @@ class _QtCase(unittest.TestCase):
         for root in self._roots:
             try:
                 root.close()
-                root.deleteLater()
             except Exception:
                 pass
+        self._roots.clear()
         try:
+            self.app.processEvents()
+            self.QtCore.QCoreApplication.sendPostedEvents(
+                None, self.QtCore.QEvent.Type.DeferredDelete)
             self.app.processEvents()
         except Exception:
             pass

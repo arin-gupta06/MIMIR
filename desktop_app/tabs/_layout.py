@@ -444,22 +444,43 @@ class CobotVisorWidget:
                 self._motion_timer.timeout.connect(self._tick_float)
                 self._motion_timer.start(50)
 
+            def closeEvent(self, event: Any) -> None:
+                try:
+                    self._timer.stop()
+                    self._motion_timer.stop()
+                except Exception:
+                    pass
+                super().closeEvent(event)
+
             def _tick_float(self) -> None:
+                if not self.isVisible() and self.parent() is None:
+                    return
                 self._float_phase += 0.1047
-                self.update()
+                try:
+                    self.update()
+                except (RuntimeError, AttributeError):
+                    pass
 
             def _bob_dy(self, phase: float) -> int:
                 return int(round(self._float_amp * math.sin(phase)))
 
             def _toggle_blink(self) -> None:
-                if not self._is_hovered:
+                if not self._is_hovered and self.isVisible():
                     self._blink = True
-                    self.update()
-                    QtCore.QTimer.singleShot(160, self._unblink)
+                    try:
+                        self.update()
+                        QtCore.QTimer.singleShot(160, self._unblink)
+                    except (RuntimeError, AttributeError):
+                        pass
 
             def _unblink(self) -> None:
                 self._blink = False
-                self.update()
+                try:
+                    if self.isVisible():
+                        self.update()
+                except (RuntimeError, AttributeError):
+                    pass
+
 
             def set_color(self, color: str) -> None:
                 if self._color != color:
@@ -508,166 +529,190 @@ class CobotVisorWidget:
                 h = self._face_h
                 painter.translate(
                     0.0, self._float_pad + self._bob_dy(self._float_phase))
-                scale = min(w, h) / 52.0
+                scale = min(w / 80.0, h / 52.0)
                 cx = w / 2.0
                 cy = h / 2.0
-                r = min(w, h) * 0.46
 
-                # 1. Soft 3D Ground Drop Shadow
-                shadow_y = cy + r * 0.90
-                shadow_rx = r * 0.75
-                shadow_ry = r * 0.22
+                # 3D Pebble dimensions (wide rounded pebble from 3D reference)
+                head_rx = 35.0 * scale
+                head_ry = 22.0 * scale
+
+                # 1. Soft 3D Ground Drop Shadow beneath the pebble
+                shadow_y = cy + head_ry * 0.95
+                shadow_rx = head_rx * 0.78
+                shadow_ry = max(2.0, head_ry * 0.22)
                 s_grad = QtGui.QRadialGradient(cx, shadow_y, shadow_rx)
-                s_grad.setColorAt(0.0, QtGui.QColor(15, 23, 42, 45))
-                s_grad.setColorAt(0.7, QtGui.QColor(15, 23, 42, 18))
+                s_grad.setColorAt(0.0, QtGui.QColor(15, 23, 42, 55))
+                s_grad.setColorAt(0.65, QtGui.QColor(15, 23, 42, 18))
                 s_grad.setColorAt(1.0, QtGui.QColor(15, 23, 42, 0))
                 painter.setBrush(QtGui.QBrush(s_grad))
                 painter.setPen(QtCore.Qt.PenStyle.NoPen)
                 painter.drawEllipse(QtCore.QPointF(cx, shadow_y), shadow_rx, shadow_ry)
 
-                stroke = "#38BDF8" if self._base_state in ("observing", "active") else self._color
+                # State color selection
+                stroke_color = "#38BDF8" if self._base_state in ("resting", "observing", "active") else self._color
 
-                # 2. Outer Soft Ambient Aura Glow
-                if self._base_state in ("observing", "listening", "thinking", "driving", "alert") or self._is_hovered:
-                    g_col = QtGui.QColor(stroke)
-                    g_col.setAlpha(42)
-                    painter.setPen(QtGui.QPen(g_col, 4.0 * scale))
-                    painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-                    painter.drawEllipse(QtCore.QPointF(cx, cy), r + 2.0 * scale, r + 2.0 * scale)
-
-                # 3. Cute Spherical Ear-Pods with glowing LED rings
-                ear_r = max(5.0 * scale, r * 0.28)
+                # 2. Side Glowing Ear Light Slits (Visible on Left/Right outer curved edge)
+                slit_w = max(2.5 * scale, 2.0)
+                slit_h = head_ry * 0.75
+                slit_y = cy - slit_h / 2.0
                 for side in (-1, 1):
-                    ear_cx = cx + side * (r + ear_r * 0.2)
-                    ear_cy = cy
-                    painter.setPen(QtCore.Qt.PenStyle.NoPen)
-                    painter.setBrush(QtGui.QBrush(QtGui.QColor(stroke)))
-                    painter.drawEllipse(QtCore.QPointF(ear_cx, ear_cy), ear_r, ear_r)
+                    slit_x = cx + side * (head_rx * 0.96) - (slit_w if side == 1 else 0.0)
+                    slit_rect = QtCore.QRectF(slit_x, slit_y, slit_w, slit_h)
+                    # Outer cyan halo glow
+                    halo_col = QtGui.QColor(stroke_color)
+                    halo_col.setAlpha(60)
+                    painter.setPen(QtGui.QPen(halo_col, 3.5 * scale))
+                    painter.setBrush(QtGui.QBrush(QtGui.QColor(stroke_color)))
+                    painter.drawRoundedRect(slit_rect, slit_w / 2.0, slit_w / 2.0)
 
-                    ear_grad = QtGui.QRadialGradient(ear_cx - side * 1.5, ear_cy - 1.5, ear_r)
-                    ear_grad.setColorAt(0.0, QtGui.QColor("#FFFFFF"))
-                    ear_grad.setColorAt(0.8, QtGui.QColor("#F1F5F9"))
-                    ear_grad.setColorAt(1.0, QtGui.QColor("#CBD5E1"))
-                    painter.setBrush(QtGui.QBrush(ear_grad))
-                    painter.drawEllipse(QtCore.QPointF(ear_cx, ear_cy), ear_r - 1.2 * scale, ear_r - 1.2 * scale)
-
-                # 4. 3D Spherical Head Body with Porcelain Radial Lighting
-                head_grad = QtGui.QRadialGradient(cx - r * 0.32, cy - r * 0.35, r * 1.35)
-                head_grad.setColorAt(0.0, QtGui.QColor("#FFFFFF"))
-                head_grad.setColorAt(0.38, QtGui.QColor("#FFFFFF"))
-                head_grad.setColorAt(0.72, QtGui.QColor("#F1F5F9"))
-                head_grad.setColorAt(0.90, QtGui.QColor("#E2E8F0"))
-                head_grad.setColorAt(1.0, QtGui.QColor("#CBD5E1"))
-                painter.setBrush(QtGui.QBrush(head_grad))
+                # 3. Outer White 3D Ceramic/Porcelain Pebble Chassis
+                chassis_grad = QtGui.QRadialGradient(cx - head_rx * 0.35, cy - head_ry * 0.40, head_rx * 1.5)
+                chassis_grad.setColorAt(0.0, QtGui.QColor("#FFFFFF"))
+                chassis_grad.setColorAt(0.45, QtGui.QColor("#FFFFFF"))
+                chassis_grad.setColorAt(0.80, QtGui.QColor("#F1F5F9"))
+                chassis_grad.setColorAt(0.94, QtGui.QColor("#E2E8F0"))
+                chassis_grad.setColorAt(1.0, QtGui.QColor("#CBD5E1"))
+                painter.setBrush(QtGui.QBrush(chassis_grad))
                 painter.setPen(QtGui.QPen(QtGui.QColor("#CBD5E1"), max(1.2 * scale, 1.0)))
-                painter.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+                painter.drawEllipse(QtCore.QPointF(cx, cy), head_rx, head_ry)
 
-                # Bottom ambient bounce reflection
-                bounce = QtGui.QRadialGradient(cx, cy + r * 0.85, r * 0.6)
-                bounce.setColorAt(0.0, QtGui.QColor(248, 250, 252, 120))
-                bounce.setColorAt(1.0, QtGui.QColor(248, 250, 252, 0))
-                painter.setBrush(QtGui.QBrush(bounce))
+                # Subtle ambient rim light bounce at the bottom of the white pebble
+                bounce_grad = QtGui.QRadialGradient(cx, cy + head_ry * 0.82, head_rx * 0.8)
+                bounce_grad.setColorAt(0.0, QtGui.QColor(255, 255, 255, 140))
+                bounce_grad.setColorAt(1.0, QtGui.QColor(255, 255, 255, 0))
+                painter.setBrush(QtGui.QBrush(bounce_grad))
                 painter.setPen(QtCore.Qt.PenStyle.NoPen)
-                painter.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+                painter.drawEllipse(QtCore.QPointF(cx, cy), head_rx, head_ry)
 
-                # 5. Inner Curved Glass Visor Dome
-                visor_w = r * 1.42
-                visor_h = r * 1.10
-                visor_rect = QtCore.QRectF(cx - visor_w / 2.0, cy - visor_h / 2.0 + 1.0, visor_w, visor_h)
+                # 4. Inset Jet-Black Glossy Screen (Recessed Visor Glass from Image)
+                screen_w = 40.0 * scale
+                screen_h = 28.0 * scale
+                screen_r = screen_h * 0.44
+                screen_rect = QtCore.QRectF(cx - screen_w / 2.0, cy - screen_h / 2.0 + 0.5 * scale, screen_w, screen_h)
 
-                visor_grad = QtGui.QLinearGradient(0, cy - visor_h / 2.0, 0, cy + visor_h / 2.0)
-                visor_grad.setColorAt(0.0, QtGui.QColor(255, 255, 255, 245))
-                visor_grad.setColorAt(1.0, QtGui.QColor(241, 245, 249, 225))
-                painter.setBrush(QtGui.QBrush(visor_grad))
-                painter.setPen(QtGui.QPen(QtGui.QColor("#E2E8F0"), 1.0))
-                painter.drawRoundedRect(visor_rect, visor_h * 0.44, visor_h * 0.44)
+                # Outer screen bevel rim / shadow
+                painter.setPen(QtGui.QPen(QtGui.QColor("#94A3B8"), 1.2 * scale))
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(screen_rect, screen_r, screen_r)
 
-                # Specular curved glass arc reflection
+                # Deep obsidian glass background
+                screen_grad = QtGui.QRadialGradient(cx, cy - screen_h * 0.15, screen_w * 0.65)
+                screen_grad.setColorAt(0.0, QtGui.QColor("#0F172A"))
+                screen_grad.setColorAt(0.55, QtGui.QColor("#080D1A"))
+                screen_grad.setColorAt(1.0, QtGui.QColor("#030712"))
+                painter.setBrush(QtGui.QBrush(screen_grad))
+                painter.setPen(QtCore.Qt.PenStyle.NoPen)
+                painter.drawRoundedRect(screen_rect, screen_r, screen_r)
+
+                # 5. Top Specular Glass Reflection (Curved Glossy Screen Highlight)
                 glass_path = QtGui.QPainterPath()
-                glass_path.addRoundedRect(QtCore.QRectF(cx - visor_w * 0.42, cy - visor_h * 0.42, visor_w * 0.84, visor_h * 0.35), visor_h * 0.22, visor_h * 0.22)
-                glass_grad = QtGui.QLinearGradient(0, cy - visor_h * 0.42, 0, cy)
-                glass_grad.setColorAt(0.0, QtGui.QColor(255, 255, 255, 190))
+                glass_h = screen_h * 0.38
+                glass_rect = QtCore.QRectF(cx - screen_w * 0.44, cy - screen_h * 0.46, screen_w * 0.88, glass_h)
+                glass_path.addRoundedRect(glass_rect, screen_r * 0.55, screen_r * 0.55)
+                glass_grad = QtGui.QLinearGradient(0, cy - screen_h * 0.46, 0, cy - screen_h * 0.46 + glass_h)
+                glass_grad.setColorAt(0.0, QtGui.QColor(255, 255, 255, 55))
+                glass_grad.setColorAt(0.7, QtGui.QColor(255, 255, 255, 12))
                 glass_grad.setColorAt(1.0, QtGui.QColor(255, 255, 255, 0))
                 painter.setBrush(QtGui.QBrush(glass_grad))
-                painter.setPen(QtCore.Qt.PenStyle.NoPen)
                 painter.drawPath(glass_path)
 
-                # 6. Cute Rosy Pink Blush Cheeks
-                eye_y = cy - 2.5 * scale
-                eye_spacing = r * 0.44
-                blush_y = eye_y + 7.5 * scale
-                blush_r = max(3.0 * scale, r * 0.11)
-                painter.setBrush(QtGui.QBrush(QtGui.QColor(244, 114, 182, 60)))
-                painter.drawEllipse(QtCore.QPointF(cx - eye_spacing - 2.0 * scale, blush_y), blush_r, blush_r * 0.7)
-                painter.drawEllipse(QtCore.QPointF(cx + eye_spacing + 2.0 * scale, blush_y), blush_r, blush_r * 0.7)
+                # 6. Glowing Expressive Eyes Inside Black Glass
+                eye_spacing = screen_w * 0.245
+                eye_y = cy + 1.2 * scale
+                eye_r = screen_h * 0.26
+                neon = QtGui.QColor(stroke_color)
 
-                # 7. Expressive Cute LED Face Elements
-                led = QtGui.QColor(stroke)
-                pen = QtGui.QPen(
-                    led, max(2.2 * scale, 1.8),
-                    QtCore.Qt.PenStyle.SolidLine,
-                    QtCore.Qt.PenCapStyle.RoundCap,
-                    QtCore.Qt.PenJoinStyle.RoundJoin,
-                )
-                painter.setPen(pen)
-                painter.setBrush(QtGui.QBrush(led))
+                # Determine if eyes are in closed/resting arc state
+                is_sleeping = (self._current_expression in ("resting", "idle") and not self._is_hovered)
+                is_blinking = (self._blink and not self._is_hovered)
 
-                def smile(w_val: float, depth: float, dy: float) -> None:
-                    path = QtGui.QPainterPath()
-                    sy = eye_y + dy * scale
-                    path.moveTo(cx - w_val * scale, sy)
-                    path.quadTo(cx, sy + depth * scale, cx + w_val * scale, sy)
-                    painter.strokePath(path, painter.pen())
+                if is_sleeping or is_blinking:
+                    # RIGHT IMAGE IN USER PROMPT: Downward gently curved glowing arcs!
+                    arc_w = eye_r * 0.95
+                    arc_h = eye_r * 0.48
 
-                if self._blink and not self._is_hovered:
-                    bl_w = 7.5 * scale
+                    # Soft neon bloom glow under arc
+                    bloom_pen = QtGui.QPen(neon, max(5.0 * scale, 3.8))
+                    bloom_col = QtGui.QColor(neon)
+                    bloom_col.setAlpha(65)
+                    bloom_pen.setColor(bloom_col)
+                    bloom_pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+                    painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+
+                    # Core bright neon line
+                    core_pen = QtGui.QPen(neon, max(3.0 * scale, 2.2))
+                    core_pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+
                     for ecx in (cx - eye_spacing, cx + eye_spacing):
-                        painter.drawLine(
-                            QtCore.QPointF(ecx - bl_w / 2, eye_y),
-                            QtCore.QPointF(ecx + bl_w / 2, eye_y))
-                    smile(3.5, 2.2, 6.5)
+                        arc_path = QtGui.QPainterPath()
+                        arc_path.moveTo(ecx - arc_w, eye_y - arc_h * 0.2)
+                        arc_path.quadTo(ecx, eye_y + arc_h, ecx + arc_w, eye_y - arc_h * 0.2)
+
+                        painter.setPen(bloom_pen)
+                        painter.strokePath(arc_path, bloom_pen)
+                        painter.setPen(core_pen)
+                        painter.strokePath(arc_path, core_pen)
+
                 elif self._is_hovered or self._current_expression == "happy":
+                    # Cute happy smiling eyes (^ ^)
+                    arc_w = eye_r * 0.90
+                    arc_h = eye_r * 0.55
+
+                    bloom_pen = QtGui.QPen(neon, max(5.0 * scale, 3.8))
+                    bloom_col = QtGui.QColor(neon)
+                    bloom_col.setAlpha(65)
+                    bloom_pen.setColor(bloom_col)
+                    bloom_pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+
+                    core_pen = QtGui.QPen(neon, max(3.0 * scale, 2.2))
+                    core_pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+
                     for ecx in (cx - eye_spacing, cx + eye_spacing):
-                        path = QtGui.QPainterPath()
-                        path.moveTo(ecx - 5.0 * scale, eye_y + 1.0 * scale)
-                        path.quadTo(ecx, eye_y - 4.5 * scale, ecx + 5.0 * scale, eye_y + 1.0 * scale)
-                        painter.strokePath(path, painter.pen())
-                    smile(5.5, 4.5, 6.5)
-                elif self._current_expression in ("resting", "idle"):
-                    for ecx in (cx - eye_spacing, cx + eye_spacing):
-                        path = QtGui.QPainterPath()
-                        path.moveTo(ecx - 4.8 * scale, eye_y - 0.5 * scale)
-                        path.quadTo(ecx, eye_y + 2.8 * scale, ecx + 4.8 * scale, eye_y - 0.5 * scale)
-                        painter.strokePath(path, painter.pen())
-                    smile(3.8, 2.8, 6.5)
-                elif self._current_expression == "alert":
-                    eye_w, eye_h = 7.5 * scale, 10.5 * scale
-                    painter.setPen(QtCore.Qt.PenStyle.NoPen)
-                    for ecx in (cx - eye_spacing, cx + eye_spacing):
-                        painter.drawRoundedRect(
-                            QtCore.QRectF(ecx - eye_w / 2.0, eye_y - eye_h / 2.0, eye_w, eye_h),
-                            eye_w / 2.0, eye_w / 2.0)
-                    painter.setPen(pen)
-                    frown = QtGui.QPainterPath()
-                    sy = eye_y + 7.5 * scale
-                    frown.moveTo(cx - 5.0 * scale, sy + 3.0 * scale)
-                    frown.quadTo(cx, sy - 1.0 * scale, cx + 5.0 * scale, sy + 3.0 * scale)
-                    painter.strokePath(frown, painter.pen())
+                        arc_path = QtGui.QPainterPath()
+                        arc_path.moveTo(ecx - arc_w, eye_y + arc_h * 0.3)
+                        arc_path.quadTo(ecx, eye_y - arc_h * 0.8, ecx + arc_w, eye_y + arc_h * 0.3)
+
+                        painter.setPen(bloom_pen)
+                        painter.strokePath(arc_path, bloom_pen)
+                        painter.setPen(core_pen)
+                        painter.strokePath(arc_path, core_pen)
+
                 else:
-                    # Observing / Active: cute big twinkling anime eyes
-                    eye_w, eye_h = 7.5 * scale, 10.5 * scale
-                    painter.setPen(QtCore.Qt.PenStyle.NoPen)
+                    # LEFT IMAGE IN USER PROMPT: Glowing circular eyes with large dark pupils and dual specular reflections!
                     for ecx in (cx - eye_spacing, cx + eye_spacing):
-                        painter.drawRoundedRect(
-                            QtCore.QRectF(ecx - eye_w / 2.0, eye_y - eye_h / 2.0, eye_w, eye_h),
-                            eye_w / 2.0, eye_w / 2.0)
-                    painter.setBrush(QtGui.QBrush(QtGui.QColor("#FFFFFF")))
-                    for ecx in (cx - eye_spacing, cx + eye_spacing):
-                        painter.drawEllipse(QtCore.QPointF(ecx + 1.0 * scale, eye_y - 2.2 * scale), 1.8 * scale, 1.8 * scale)
-                        painter.drawEllipse(QtCore.QPointF(ecx - 1.5 * scale, eye_y + 1.8 * scale), 1.0 * scale, 1.0 * scale)
-                    painter.setPen(pen)
-                    smile(4.8, 3.8, 6.8)
+                        # Outer cyan halo/bloom
+                        halo_col = QtGui.QColor(neon)
+                        halo_col.setAlpha(55)
+                        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+                        painter.setBrush(QtGui.QBrush(halo_col))
+                        painter.drawEllipse(QtCore.QPointF(ecx, eye_y), eye_r + 2.5 * scale, eye_r + 2.5 * scale)
+
+                        # Luminous cyan eye base
+                        painter.setBrush(QtGui.QBrush(neon))
+                        painter.drawEllipse(QtCore.QPointF(ecx, eye_y), eye_r, eye_r)
+
+                        # Inner dark pupil with crescent edge revealing the glowing bottom iris
+                        pupil_r = eye_r * 0.76
+                        pupil_offset_y = -eye_r * 0.08  # Leaves cyan glowing crescent at the bottom!
+                        painter.setBrush(QtGui.QBrush(QtGui.QColor("#030712")))
+                        painter.drawEllipse(QtCore.QPointF(ecx, eye_y + pupil_offset_y), pupil_r, pupil_r)
+
+                        # Specular reflections (Catchlights from image)
+                        # 1. Primary large catchlight (Upper-Left)
+                        s1_r = eye_r * 0.28
+                        s1_x = ecx - eye_r * 0.22
+                        s1_y = eye_y - eye_r * 0.28
+                        painter.setBrush(QtGui.QBrush(QtGui.QColor("#FFFFFF")))
+                        painter.drawEllipse(QtCore.QPointF(s1_x, s1_y), s1_r, s1_r)
+
+                        # 2. Secondary small catchlight (Lower-Left accent)
+                        s2_r = eye_r * 0.12
+                        s2_x = ecx - eye_r * 0.12
+                        s2_y = eye_y + eye_r * 0.22
+                        painter.drawEllipse(QtCore.QPointF(s2_x, s2_y), s2_r, s2_r)
 
                 painter.end()
+
 
         return _Visor()

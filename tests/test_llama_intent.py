@@ -44,7 +44,9 @@ class TestLocalLlamaIntent(unittest.TestCase):
         )
         self.assertIsNone(res)
 
-    @patch("mimir.llama_intent.urllib.request.urlopen")
+    # Loopback calls bypass proxies via the module opener; the mocked
+    # HTTP seam moved with them (assertions unchanged).
+    @patch("mimir.llama_intent._LOOPBACK_OPENER.open")
     def test_mocked_llm_approval(self, mock_urlopen):
         """Test parsing an informal approval sentence with pending action."""
         mock_resp = MagicMock()

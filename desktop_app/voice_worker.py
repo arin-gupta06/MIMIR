@@ -59,14 +59,12 @@ class SpeakWorker(QtCore.QThread):
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
-        """Ask the worker to drop its result (cooperative).
-
-        The blocking TTS call itself cannot be preempted and already
-        queued audio still plays; the completion is reported as
-        ``speak_cancelled`` instead of ``speak_finished`` so follow-up
-        speech does not overlap stale lines.
-        """
+        """Ask the worker to drop its result and silence active speech."""
         self._cancel.set()
+        try:
+            self._voice.stop_speaking()
+        except Exception:
+            pass
 
     @property
     def is_cancelled(self) -> bool:

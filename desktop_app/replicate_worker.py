@@ -247,6 +247,7 @@ class ReplicateWorker(QtCore.QThread):
         if self._force_offline:
             return None
         try:
+            from .llm import LLMError, normalize_provider
             from .prefs import DesktopPrefs
             from .state import get_llm_fn
 
@@ -263,6 +264,34 @@ class ReplicateWorker(QtCore.QThread):
                         setattr(prefs, key, self._llm_prefs[key])
                     except Exception:
                         pass
+            if normalize_provider(prefs.model_provider) == "ollama":
+                # Runs on the worker thread: a fast preflight gives an
+                # actionable fallback message (instead of a 120s stall)
+                # and picks the best installed model when none is set.
+                try:
+                    from .ollama import best_model_for, probe_ollama
+
+                    endpoint = (
+                        prefs.model_endpoint or "").strip()
+                    report = probe_ollama(
+                        endpoint or
+                        "http://127.0.0.1:11434", timeout_s=0.6)
+                    if not report["available"]:
+                        where = report["endpoint"]
+
+                        def _ollama_down(prompt: str) -> str:
+                            raise LLMError(
+                                f"ollama unreachable at {where} "
+                                "(start it via Settings → Model → "
+                                "Start Ollama, or pick another provider)"
+                            )
+
+                        return _ollama_down
+                    if not (prefs.model_name or "").strip():
+                        prefs.model_name = best_model_for(
+                            None, report["endpoint"])
+                except Exception:
+                    pass  # preflight failure degrades to lazy client
             return get_llm_fn(prefs)
         except Exception:
             return None  # prefs/client failure degrades to offline

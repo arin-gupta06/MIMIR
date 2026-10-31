@@ -28,6 +28,7 @@ from .tabs._qt import load_qt
 __all__ = [
     "COUNTDOWN_SEC",
     "DriveWorker",
+    "acquire_editor_target",
     "create_drive_worker",
     "drive_text_blocking",
     "format_countdown",
@@ -94,6 +95,50 @@ def list_drive_targets(
     handles = {handle for handle, _ in items}
     selected = fg_handle if fg_handle in handles else None
     return (items, selected)
+
+
+def acquire_editor_target(
+    backend: Any = None,
+    allowed_titles: Any = None,
+    *,
+    focus: bool = False,
+) -> Optional[TargetSpec]:
+    """Bridge 2 pre-flight: locate a code editor, focus it, verify it.
+
+    Returns ``TargetSpec(handle=...)`` for the first live editor window
+    (VS Code, Cursor, PyCharm, ...), or None when no editor is visible
+    or window enumeration is unavailable. With ``focus=True`` the
+    editor is also activated and foreground ownership is verified
+    (focusing steals the user's focus, so the drive dialog pre-selects
+    with ``focus=False`` and lets the focus guard activate at drive
+    time instead). Never raises.
+    """
+    if backend is None:
+        try:
+            from mimir.desktop import PyWin32WindowBackend
+            backend = PyWin32WindowBackend()
+        except Exception:
+            return None
+    try:
+        from mimir.desktop import find_editor_window, focus_window
+    except ImportError:
+        return None
+    try:
+        found = find_editor_window(backend, allowed_titles)
+    except Exception:
+        return None
+    if found is None:
+        return None
+    if focus:
+        try:
+            if not focus_window(backend, found.handle):
+                return None
+        except Exception:
+            return None
+    try:
+        return TargetSpec(handle=int(found.handle))
+    except (TypeError, ValueError):
+        return None
 
 
 def drive_text_blocking(actuator: DesktopActuator, text: str, *,

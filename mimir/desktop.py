@@ -38,6 +38,7 @@ from .actuator import ActuatorError, TargetValidationError
 from .events import EventBus, EventType
 
 __all__ = [
+    "DEFAULT_EDITOR_TITLES",
     "FocusGuard",
     "PyWin32WindowBackend",
     "SendInputKeyboard",
@@ -45,6 +46,8 @@ __all__ = [
     "TargetSpec",
     "WindowBackend",
     "WindowInfo",
+    "find_editor_window",
+    "focus_window",
     "resolve_target",
     "validate_target",
     "verify_completion",
@@ -500,6 +503,91 @@ def resolve_target(
             operation=operation,
         )
     return info
+
+
+#: Title/executable substrings identifying code editors for Bridge 2
+#: target acquisition (VS Code, Cursor, PyCharm, Sublime, ...).
+DEFAULT_EDITOR_TITLES = (
+    "Visual Studio Code",
+    "Code - OSS",
+    "Cursor",
+    "PyCharm",
+    "Sublime Text",
+    "Neovim",
+    " - Code",
+    ".py",
+)
+
+
+def find_editor_window(
+    backend: WindowBackend,
+    allowed_titles: Optional[list[str] | tuple[str, ...]] = None,
+) -> Optional[WindowInfo]:
+    """First live window matching a code editor (None when none match).
+
+    Convenience over :meth:`WindowBackend.list_windows` for the drive
+    pre-flight: scans titles + executable names for
+    ``allowed_titles`` (default :data:`DEFAULT_EDITOR_TITLES`) and
+    returns the first handle that is still valid. Never raises —
+    enumeration failures degrade to None so callers fall back to the
+    explicit target picker.
+    """
+    needles = [
+        str(title).strip().lower()
+        for title in (DEFAULT_EDITOR_TITLES
+                      if allowed_titles is None else allowed_titles)
+        if str(title).strip()
+    ]
+    if not needles:
+        return None
+    try:
+        windows = backend.list_windows()
+    except Exception:
+        return None
+    for info in windows or []:
+        haystack = (
+            f"{getattr(info, 'executable', '') or ''} "
+            f"{getattr(info, 'title', '') or ''}".lower()
+        )
+        if not any(needle in haystack for needle in needles):
+            continue
+        try:
+            if backend.is_valid(info.handle):
+                return info
+        except Exception:
+            continue
+    return None
+
+
+def focus_window(
+    backend: WindowBackend,
+    handle: int,
+    *,
+    verify: bool = True,
+) -> bool:
+    """Activate ``handle`` and verify foreground ownership (bool).
+
+    Thin convenience over :meth:`WindowBackend.activate` plus
+    :func:`verify_foreground`: returns True only when the OS grants
+    the switch (or when ``verify=False`` skips the check). Never
+    raises — refusals and backend errors degrade to False.
+    """
+    try:
+        handle = check_int(handle, field="handle", minimum=1)
+    except ValueError:
+        return False
+    try:
+        if not backend.activate(handle):
+            return False
+    except Exception:
+        return False
+    if not verify:
+        return True
+    try:
+        verify_foreground(backend, handle, operation="focus_window")
+    except Exception:
+        return False
+    return True
 
 
 def _live_snapshot(

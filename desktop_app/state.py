@@ -31,6 +31,17 @@ __all__ = ["AppState", "DEFAULT_STORE_PATH", "get_llm_fn"]
 
 DEFAULT_STORE_PATH = "mimir_memory.db"
 
+#: Local-Llama structured intents -> legacy companion intent names.
+_LLAMA_TO_LEGACY = {
+    "STOP": "stop",
+    "SLEEP": "sleep",
+    "STATUS_INQUIRY": "status_inquiry",
+    "PUSH_CODE": "push_code",
+    "FORBID": "forbid",
+    "APPROVE_PENDING_ACTION": "approve",
+    "APPROVE": "approve",
+}
+
 
 def get_llm_fn(prefs: DesktopPrefs) -> Optional[Callable[[str], str]]:
     """Build a pluggable LLM completion function from user preferences.
@@ -106,6 +117,8 @@ class AppState:
     safety: SafetyController = field(default_factory=SafetyController)
     action_registry: Optional[ActionRegistry] = field(
         default=None, repr=False)
+    _sensory: Any = field(default=None, repr=False)
+    _sensory_tokens: list[Any] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         if self.action_registry is None:
@@ -133,6 +146,7 @@ class AppState:
         return self._store
 
     def close(self) -> None:
+        self.stop_senses()
         if self._store is not None:
             self._store.close()
             self._store = None
@@ -140,6 +154,116 @@ class AppState:
     def reopen(self, path: str) -> None:
         self.close()
         self.store_path = path
+
+    # -- Live Ambient Senses (Phase 4.1 & 4.2) ----------------------------
+    @property
+    def live_senses(self) -> Optional[dict[str, Any]]:
+        """Introspection snapshot of background sensory watcher (or None)."""
+        if self._sensory is None:
+            return None
+        try:
+            return dict(self._sensory.status())
+        except Exception:
+            return None
+
+    def start_senses(
+        self,
+        roots: Optional[Sequence[str]] = None,
+        repo: Optional[str] = None,
+        debounce_s: float = 0.3,
+    ) -> bool:
+        """Launch watchdog FS monitor & AST streaming inside AppState (Phase 4.1).
+
+        Monitors workspace roots, computes 300ms-debounced AST deltas, streams
+        structural changes to the Detective engine (Phase 4.2), and binds
+        the Visor to the event bus for reactive micro-animations (Phase 4.3).
+        """
+        self.stop_senses()
+        try:
+            from pathlib import Path
+            from mimir.ast_delta import ast_delta_to_episode
+            from mimir.events import Event, bind_visor_to_bus, get_event_bus
+            from mimir.sensory import SensoryService
+        except ImportError:
+            return False
+
+        effective_roots = list(roots or [])
+        if not effective_roots:
+            effective_roots = list(self.default_roots())
+        target_repo = repo or self.prefs.last_repo or ""
+        if target_repo and target_repo not in effective_roots:
+            effective_roots.append(target_repo)
+        live = [r for r in effective_roots if Path(r).is_dir()]
+        if not live:
+            return False
+
+        bus = self.event_bus if self.event_bus is not None else get_event_bus()
+        try:
+            service = SensoryService(
+                live,
+                repo=target_repo or None,
+                allowed_roots=effective_roots,
+                bus=bus,
+                session_id=self.session_id,
+                debounce_s=debounce_s,
+            )
+            service.start()
+        except Exception:
+            return False
+        self._sensory = service
+
+        tokens: list[Any] = []
+        try:
+            tokens.extend(bind_visor_to_bus(self.visor, bus))
+        except Exception:
+            pass
+
+        # Stream AST structural modifications to Detective engine (Phase 4.2)
+        def _on_ast_delta(event: Event) -> None:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            try:
+                ep = ast_delta_to_episode(payload, repo=target_repo)
+            except Exception:
+                ep = None
+            if ep is not None:
+                # Add to state episodes cache for Detective inference
+                seen = {e.id for e in self.episodes}
+                if ep.id not in seen:
+                    self.episodes.insert(0, ep)
+                self._emit(EventType.PATTERN_DETECTED, "sensory.ast_stream", {
+                    "episode_id": ep.id,
+                    "summary": ep.summary,
+                    "file": payload.get("file"),
+                })
+
+        try:
+            tokens.append(
+                bus.subscribe(
+                    EventType.AST_DELTA,
+                    _on_ast_delta,
+                    name="state:ast_to_detective",
+                )
+            )
+        except Exception:
+            pass
+
+        self._sensory_tokens = tokens
+        return True
+
+    def stop_senses(self) -> None:
+        """Stop background senses daemon and unbind tokens (idempotent)."""
+        service, self._sensory = self._sensory, None
+        if service is not None:
+            try:
+                service.stop()
+            except Exception:
+                pass
+        tokens, self._sensory_tokens = self._sensory_tokens, []
+        for t in tokens:
+            try:
+                t.unsubscribe()
+            except Exception:
+                pass
 
     # -- Observe tab (telemetry + detective) ------------------------------
     def observe(
@@ -176,18 +300,34 @@ class AppState:
                     else list(self.episodes))
             principles = infer_principles(
                 used, min_cluster_size=min_cluster_size)
-            for principle in principles:
-                self.store.save(principle)
-            self.learned_ids.update(e.id for e in used)
-            self._emit(EventType.INFERENCE_COMPLETED,
-                       "cognitive.inference_engine", {
-                           "principle_ids": [p.id for p in principles],
-                           "episode_ids": [e.id for e in used],
-                           "count": len(principles),
-                       })
-            return principles
+            return self.commit_principles(
+                principles, [e.id for e in used])
         finally:
             self.visor.set_state(VisorState.RESTING)
+
+    def commit_principles(
+        self,
+        principles: Sequence[BehavioralPrinciple],
+        episode_ids: Optional[Sequence[str]] = None,
+    ) -> list[BehavioralPrinciple]:
+        """Persist mined principles (main-thread half of worker learning).
+
+        The Observe tab mines on a worker thread (sqlite connections
+        are thread-bound) and commits here on the UI thread, keeping
+        one persist + telemetry path with :meth:`learn`.
+        """
+        stored = list(principles)
+        for principle in stored:
+            self.store.save(principle)
+        if episode_ids:
+            self.learned_ids.update(episode_ids)
+        self._emit(EventType.INFERENCE_COMPLETED,
+                   "cognitive.inference_engine", {
+                       "principle_ids": [p.id for p in stored],
+                       "episode_ids": list(episode_ids or []),
+                       "count": len(stored),
+                   })
+        return stored
 
     # -- Memory tab (store) ----------------------------------------------
     def list_principles(self) -> list[BehavioralPrinciple]:
@@ -246,13 +386,33 @@ class AppState:
 
     def voice_coordinator(self) -> VoiceCoordinator:
         """Speech coordinator honoring the user's voice/language prefs."""
-        language = (getattr(self.prefs, "language", "") or "").strip().lower()
-        whisper_lang = "hi" if "hindi" in language or "hinglish" in language else "en"
-        return VoiceCoordinator(
-            voice=(getattr(self.prefs, "voice_persona", "") or "").strip()
-            or "en-US-AriaNeural",
-            language=whisper_lang,
-        )
+        inst = getattr(self, "_voice_coordinator_instance", None)
+        if inst is None:
+            language = (getattr(self.prefs, "language", "") or "").strip().lower()
+            whisper_lang = "hi" if "hindi" in language or "hinglish" in language else "en"
+            inst = VoiceCoordinator(
+                voice=(getattr(self.prefs, "voice_persona", "") or "").strip()
+                or "en-US-AriaNeural",
+                language=whisper_lang,
+            )
+            self._voice_coordinator_instance = inst
+        return inst
+
+    def stop_speaking(self) -> None:
+        """Immediately interrupt and silence any active speech synthesis or playback."""
+        inst = getattr(self, "_voice_coordinator_instance", None)
+        if inst is not None:
+            try:
+                inst.stop_speaking()
+            except Exception:
+                pass
+        worker = getattr(self, "_active_speak_worker", None)
+        if worker is not None:
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+            self._active_speak_worker = None
 
     def try_listen(self, timeout_sec: float = 5.0,
                    coordinator: VoiceCoordinator | None = None
@@ -312,6 +472,53 @@ class AppState:
     # -- Act & Voice tab ---------------------------------------------------
     def parse_utterance(self, text: str) -> dict[str, str]:
         return self.voice.parse_intent(text)
+
+    def parse_utterance_smart(
+        self, text: str, *, timeout_s: float = 3.5
+    ) -> dict[str, str]:
+        """Parse an utterance, consulting local Llama when regex is unsure.
+
+        Fast path: the deterministic keyword parser wins whenever it
+        recognizes the text (it owns safety words like "stop"). Only an
+        ``unknown`` verdict falls through to
+        :func:`mimir.llama_intent.query_local_llama_intent`, whose
+        structured intent is mapped back onto the legacy intent names
+        :meth:`respond` understands. Any Llama failure (daemon down,
+        timeout, unparseable reply) degrades to the regex verdict, so
+        this never raises for backend reasons. May include a ``"reply"``
+        key with Llama's speakable confirmation.
+        """
+        parsed = self.parse_utterance(text)
+        if parsed.get("intent") not in ("unknown", None, ""):
+            return parsed
+        try:
+            from mimir.llama_intent import query_local_llama_intent
+
+            pending = None
+            registry = self.action_registry
+            if registry is not None:
+                try:
+                    pending = registry.list_pending()
+                except Exception:
+                    pending = None
+            result = query_local_llama_intent(
+                parsed.get("text", text),
+                pending_actions=pending,
+                timeout_s=timeout_s,
+            )
+        except Exception:
+            return parsed
+        if not result:
+            return parsed
+        legacy = _LLAMA_TO_LEGACY.get(
+            str(result.get("intent", "UNKNOWN")).strip().upper())
+        if legacy is None:
+            return parsed
+        smart = {"intent": legacy, "text": parsed.get("text", text)}
+        reply = str(result.get("reply", "") or "").strip()
+        if reply:
+            smart["reply"] = reply
+        return smart
 
     def voice_service(
         self,
@@ -412,6 +619,34 @@ class AppState:
                 return approved
         return self._legacy_reply(intent, text)
 
+
+
+    def register_negative_invariant(self, rule: str) -> Any:
+        """Register an instant negative invariant in memory (e.g. from E-stop correction)."""
+        import uuid
+        from mimir.principles import (
+            BehavioralPrinciple,
+            ContextTrigger,
+            EpistemicStatus,
+        )
+        cleaned = rule.strip()
+        p = BehavioralPrinciple(
+            id=f"bp_forbid_{uuid.uuid4().hex[:8]}",
+            name=f"Negative invariant: {cleaned[:32]}",
+            category="safety",
+            context_trigger=ContextTrigger(scope="safety", language_agnostic=True),
+            latent_invariant=cleaned,
+            anti_patterns=(cleaned,),
+            epistemic_status=EpistemicStatus.new(0.99, supporting=1),
+            inspectable_traces=("e_stop_correction",),
+        )
+        self.store.save(p)
+        self._emit(EventType.INFERENCE_COMPLETED, "safety.invariant_learner", {
+            "principle_ids": [p.id],
+            "rule": cleaned,
+        })
+        return p
+
     def _legacy_reply(self, intent: str, text: str) -> str:
         """Companion wording for a parsed intent (no side effects)."""
         from .presenters import format_memory_summary
@@ -421,7 +656,19 @@ class AppState:
         if intent == "sleep":
             return "Resting. Switch tabs or press Rest / Wake when ready."
         if intent == "status_inquiry":
-            return f"Here is what I have learned:\n{format_memory_summary(self.list_principles())}"
+            principles = self.list_principles()
+            if not principles:
+                return "Behavioral Memory is currently empty. Observe your workspace or run the showcase to learn your habits."
+            count = len(principles)
+            bullets = "\n".join(f"• {p.name}" for p in principles[:6])
+            extra = f"\n• ...and {count - 6} more personalized habits" if count > 6 else ""
+            return (
+                f"Here is what I have learned from your coding style ({count} principles):\n"
+                f"{bullets}{extra}\n\n"
+                f"Tip: Explore individual principles in the Memory tab anytime.\n\n"
+                f"[Extended Technical Breakdown]\n"
+                f"{format_memory_summary(principles)}"
+            )
         if intent == "push_code":
             hits = self.search("commit push github workflow",
                                top_k=3, min_confidence=0.0)
@@ -439,6 +686,7 @@ class AppState:
             return f"Noted and avoided from now on: {text.strip()}"
         return ("I didn't catch that. Try 'status', 'push my code', "
                 "'sleep', or 'stop'.")
+
 
     def memory_stats(self) -> dict[str, float]:
         """Dashboard figures: principle count and mean confidence."""

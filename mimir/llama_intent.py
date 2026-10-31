@@ -30,13 +30,19 @@ FALLBACK_LOCAL_MODELS = ("llama3.2:1b", "llama3.2", "mistral:latest", "qwen3:8b"
 _FAST_PATH_STOP = re.compile(r"\b(stop|halt|abort|kill|freeze|emergency)\b", re.IGNORECASE)
 _FAST_PATH_SLEEP = re.compile(r"\b(sleep|rest|standby|take a break)\b", re.IGNORECASE)
 
+#: Loopback calls must never leave the machine: bypass any configured
+#: HTTP(S) proxy (which would otherwise add seconds of timeouts or leak
+#: on-device prompts to a middlebox).
+_LOOPBACK_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}))
+
 
 def is_ollama_available(endpoint: str = DEFAULT_LOCAL_ENDPOINT, timeout_s: float = 0.5) -> bool:
     """Fast check whether the local Ollama instance is alive."""
     try:
         url = endpoint.rstrip("/") + "/api/tags"
         req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with _LOOPBACK_OPENER.open(req, timeout=timeout_s) as resp:
             return resp.status == 200
     except Exception:
         return False
@@ -47,7 +53,7 @@ def get_available_local_models(endpoint: str = DEFAULT_LOCAL_ENDPOINT, timeout_s
     try:
         url = endpoint.rstrip("/") + "/api/tags"
         req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with _LOOPBACK_OPENER.open(req, timeout=timeout_s) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
             return [m["name"] for m in data.get("models", []) if "name" in m]
     except Exception:
@@ -191,7 +197,7 @@ def query_local_llama_intent(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout_s) as response:
+        with _LOOPBACK_OPENER.open(req, timeout=timeout_s) as response:
             raw = response.read().decode("utf-8", errors="replace")
             res_obj = json.loads(raw)
             model_text = (res_obj.get("response") or "").strip()

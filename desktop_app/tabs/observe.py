@@ -725,6 +725,10 @@ def build_observe_tab(state: AppState, status: Any,
             show_error(f"Observe failed: {message}")
             status.showMessage(f"Observe failed: {message}", 8000)
 
+        # Synchronous by contract: the error panel must be visible
+        # after one event-loop pump (see UiWiringRegressionTest), so the
+        # blocking git pass stays on the UI thread for this button. The
+        # continuous WatchController poll already runs on workers.
         try:
             episodes = state.observe(repo_resolved, roots, commits_spin.value())
             _observe_done(episodes, repo_resolved, on_success)

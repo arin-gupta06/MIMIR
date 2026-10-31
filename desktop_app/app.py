@@ -150,7 +150,6 @@ class MainWindow:
         if self.visor_pill is not None:
             try:
                 self.visor_pill.close()
-                self.visor_pill.deleteLater()
             except Exception:
                 pass
             self.visor_pill = None
@@ -390,6 +389,92 @@ def _scroll_off() -> Any:
     return _Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
 
+def _schedule_startup_probe(main: MainWindow, window: Any) -> None:
+    """Bridge 1: Ollama health-check shortly after launch (background).
+
+    Never blocks startup: a worker thread probes the loopback daemon
+    1.5s after the window appears, then reports through the status
+    bar. A fresh offline install auto-upgrades to the live Ollama
+    engine when the daemon answers (explicit provider choices are
+    never overridden).
+    """
+    try:
+        _, QtCore, _, _ = load_qt()
+        from .observe_worker import create_callable_worker
+        from .ollama import ollama_endpoint, probe_ollama
+    except ImportError:
+        return
+    state = main.state
+
+    def _fire() -> None:
+        try:
+            endpoint = ollama_endpoint(getattr(state, "prefs", None))
+        except Exception:
+            endpoint = "http://127.0.0.1:11434"
+        try:
+            worker = create_callable_worker(
+                probe_ollama, (endpoint,), {"timeout_s": 1.0},
+                parent=window)
+        except Exception:
+            return
+        try:
+            status = window.statusBar()
+        except Exception:
+            status = None
+
+        def _done(report: object) -> None:
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+            data = report if isinstance(report, dict) else {}
+            if not data.get("available"):
+                if status is not None:
+                    status.showMessage(
+                        "Ollama offline — using the offline scaffold "
+                        "(Settings → Model → Start Ollama for live AI).",
+                        8000)
+                return
+            selected = str(data.get("selected") or "llama3.2:1b")
+            try:
+                prefs = state.prefs
+                provider = (
+                    getattr(prefs, "model_provider", "") or "").strip()
+                if provider in ("", "offline"):
+                    prefs.model_provider = "ollama"
+                    if not (getattr(prefs, "model_name", "")
+                            or "").strip():
+                        prefs.model_name = str(selected)
+                    prefs.save()
+                    if status is not None:
+                        status.showMessage(
+                            "Ollama live — engine switched to ollama "
+                            f"({selected}).", 8000)
+                    return
+            except Exception:
+                pass
+            if status is not None:
+                status.showMessage(f"Ollama live: {selected}.", 5000)
+
+        def _failed(_message: str) -> None:
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+        try:
+            worker.callable_finished.connect(_done)
+            worker.callable_error.connect(_failed)
+            worker.start()
+        except Exception:
+            pass
+
+    try:
+        QtCore.QTimer.singleShot(1500, _fire)
+    except Exception:
+        pass
+
+
 def run(argv: list[str] | None = None, store: str = DEFAULT_STORE_PATH) -> int:
     """Launch the desktop app (returns a Qt exit code)."""
     _, _, _, QtWidgets = load_qt()
@@ -416,9 +501,22 @@ def run(argv: list[str] | None = None, store: str = DEFAULT_STORE_PATH) -> int:
     main = MainWindow(state)
     window = main.build()
     window.show()
+    _schedule_startup_probe(main, window)
     try:
         return int(app.exec())
     finally:
+        try:
+            main.shutdown()
+        except Exception:
+            pass
+        try:
+            app.processEvents()
+            _, _qc, _, _ = load_qt()
+            if hasattr(_qc, "QCoreApplication") and hasattr(_qc, "QEvent"):
+                _qc.QCoreApplication.sendPostedEvents(None, _qc.QEvent.Type.DeferredDelete)
+            app.processEvents()
+        except Exception:
+            pass
         try:
             from mimir.isolation import LoopOwner
             if LoopOwner.owner() == "desktop-app":
